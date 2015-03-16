@@ -41,7 +41,19 @@ class FlvReader(io.BytesIO):
     Reader for Flv files
     The file format is documented in https://www.adobe.com/devnet/f4v.html
     """
-
+    indexString = 0
+    def read_metadata_filesize(self):
+        indexString = self.getvalue().index('filesize')
+        self.read(indexString)
+        self.read_string()
+        return self.read_Number_to_double()
+    def read_metadata_duration(self):
+        indexString = self.getvalue().index('duration')
+        self.read(indexString)
+        self.read_string()
+        return self.read_Number_to_double()
+    def read_Number_to_double(self):
+        return unpack('>d', self.read(8))[0]
     # Utility functions for reading numbers and strings
     def read_unsigned_long_long(self):
         return unpack('!Q', self.read(8))[0]
@@ -116,6 +128,8 @@ class FlvReader(io.BytesIO):
                               'duration': duration,
                               'discontinuity_indicator': discontinuity_indicator,
                               })
+            print 'fragments'
+            print fragments
         #print 'fragments',fragments
         return {'version': version,
                 'time_scale': time_scale,
@@ -169,7 +183,7 @@ class FlvReader(io.BytesIO):
         return {'segments': segments,
                 'movie_identifier': movie_identifier,
                 'drm_data': drm_data,
-                'fragments': fragments,
+                'fragments': fragments
                 },islive
 
     def read_bootstrap_info(self):
@@ -186,7 +200,7 @@ class FlvReader(io.BytesIO):
 def read_bootstrap_info(bootstrap_bytes):
     return FlvReader(bootstrap_bytes).read_bootstrap_info()
 
-def build_fragments_list(boot_info, startFromFregment=None, live=True):
+def build_fragments_list(boot_info,total_size,total_duration,startFromFregment=None, live=True):
     """ Return a list of (segment, fragment) for each fragment in the video """
     res = []
     segment_run_table = boot_info['segments'][0]
@@ -250,9 +264,26 @@ def build_fragments_list(boot_info, startFromFregment=None, live=True):
         if (not startFromFregment==None) and startFromFregment>=frag_start and startFromFregment<=frag_end:
             frag_start=startFromFregment
         #print 'frag_start',frag_start,frag_end
-        for currentFreg in range(frag_start,frag_end+1):
-             res.append((seg,currentFreg ))
+        #custom ordering for byte and duration calculus
+        fragmentsSorted = boot_info['fragments'][0]['fragments']
+        fragmentsSorted.sort(key=lambda frag: frag['first'],reverse = True)
+        indexFragSorted = 0
+        startByte = total_size
+        fragSize = 0
+        startDuration = fragmentsSorted[0]['duration']
+        totalSizeCheck = 0
+        fragmentsSorted =  [frag for frag in fragmentsSorted if frag['duration'] != 0 and frag['first'] != 0]
+        for currentFreg in range(frag_end,frag_start-1,-1):
+            startDuration = fragmentsSorted[indexFragSorted]['duration']
+            fragSize = (total_size * startDuration) / (total_duration * 1000)
+            startByte = startByte - fragSize
+            if(fragmentsSorted[indexFragSorted]['first'] == currentFreg):
+                indexFragSorted += 1
+            res.append((seg,currentFreg,startDuration,fragSize,(startByte, 0)[bool(startByte<0)]))
+            totalSizeCheck += fragSize
+        res.sort(key = lambda frag:(frag[0],frag[1]))
     print 'fragmentlist',res,boot_info
+    print 'checksize',totalSizeCheck
     return res
 
     
@@ -347,15 +378,6 @@ class F4MDownloader():
             traceback.print_exc()
             return None
             
-    def _write_flv_header2(self, stream):
-        """Writes the FLV header and the metadata to stream"""
-        # FLV header
-        stream.write(b'FLV\x01')
-        stream.write(b'\x01')
-        stream.write(b'\x00\x00\x00\x09')
-        # FLV File body
-        stream.write(b'\x00\x00\x00\x09')
-
         
     def _write_flv_header(self, stream, metadata):
         """Writes the FLV header and the metadata to stream"""
@@ -374,11 +396,24 @@ class F4MDownloader():
         # All this magic numbers have been extracted from the output file
         # produced by AdobeHDS.php (https://github.com/K-S-V/Scripts)
             stream.write(b'\x00\x00\x01\x73')
+    
+    def _write_flv_header2(self, stream):
+        """Writes the FLV header and the metadata to stream"""
+        # FLV header
+        stream.write(b'FLV\x01')
+        stream.write(b'\x01')
+        stream.write(b'\x00\x00\x00\x09')
+        # FLV File body
+        stream.write(b'\x00\x00\x00\x09')
 
     def init(self, out_stream, url, proxy=None,use_proxy_for_chunks=True,g_stopEvent=None, maxbitrate=0, auth=''):
         try:
+            self.statusStream=''
             self.init_done=False
             self.total_frags=0
+            self.total_size=0
+            self.total_duration=0
+            self.fragments_list = []
             self.init_url=url
             self.clientHeader=None
             self.status='init'
@@ -426,6 +461,7 @@ class F4MDownloader():
             try:
                 print manifest
             except: pass
+            
             self.status='manifest done'
             #self.report_destination(filename)
             #dl = ReallyQuietDownloader(self.ydl, {'continuedl': True, 'quiet': True, 'noprogress':True})
@@ -444,7 +480,6 @@ class F4MDownloader():
                 manifest=manifest.replace('\"bootstrapInfoId','\" bootstrapInfoId')
 
             doc = etree.fromstring(manifest)
-            print doc
             
             # Added the-one 05082014
             # START
@@ -494,10 +529,17 @@ class F4MDownloader():
             try:
                 self.metadata = base64.b64decode(media.find(_add_ns('metadata')).text)
                 print 'metadata stream read done'#,media.find(_add_ns('metadata')).text
-
-                #self._write_flv_header(dest_stream, metadata)
-                #dest_stream.flush()
-            except: pass
+                self.total_size = FlvReader(self.metadata).read_metadata_filesize()
+                self.total_duration = FlvReader(self.metadata).read_metadata_duration()
+                print 'totalsize in bytes'
+                print self.total_size
+                print 'totalsize in megabytes'
+                print self.total_size / 1024 / 1024
+                print 'duration in seconds'
+                print self.total_duration
+                print 'duration in minutes'
+                print self.total_duration / 60
+            except:  traceback.print_exc()
         
             # Modified the-one 05082014
             # START
@@ -536,6 +578,10 @@ class F4MDownloader():
                 try:
                     self.metadata = base64.b64decode(media.find(_add_ns('metadata')).text)
                     print 'metadata stream read done'
+                    readerFile = FlvReader(self.metadata)
+                    self.total_size = readerFile.read_metadata_filesize()
+                    readerDuration = FlvReader(self.metadata)
+                    self.total_duration = readerDuration.read_metadata_duration()
                 except: pass
                 
                 try:
@@ -615,27 +661,30 @@ class F4MDownloader():
         return False
 
         
-    def keep_sending_video(self,dest_stream, segmentToStart=None, totalSegmentToSend=0):
+    def keep_sending_video(self,dest_stream, fragmentToStart=None, totalSegmentToSend=0,startRange=0):
         try:
             self.status='download Starting'
-            self.downloadInternal(self.url,dest_stream,segmentToStart,totalSegmentToSend)
+            self.downloadInternal(self.url,dest_stream,fragmentToStart,totalSegmentToSend,startRange)
         except: 
             traceback.print_exc()
         self.status='finished'
             
-    def downloadInternal(self,url,dest_stream ,segmentToStart=None,totalSegmentToSend=0):
+    def downloadInternal(self,url,dest_stream ,fragmentToStart=None,totalSegmentToSend=0,startRange = 0):
         global F4Mversion
         try:
             #dest_stream =  self.out_stream
             queryString=self.queryString
-            print 'segmentToStart',segmentToStart
-            if self.live or segmentToStart==0 or segmentToStart==None:
-                print 'writing metadata'#,len(self.metadata)
+            print 'fragmentToStart',fragmentToStart
+            
+            print 'writing metadata'#,len(self.metadata)
+            if(fragmentToStart == 1 and self.statusStream == 'seeking'):
                 self._write_flv_header(dest_stream, self.metadata)
                 dest_stream.flush()
-            #elif segmentToStart>0 and not self.live:
-            #    self._write_flv_header2(dest_stream)
-            #    dest_stream.flush()
+            elif(fragmentToStart != 1 and self.statusStream == 'seeking'):
+                self._write_flv_header2(dest_stream)
+                dest_stream.flush()
+                
+           
             
             url=self.url
   
@@ -652,23 +701,14 @@ class F4MDownloader():
 
 
             frags_filenames = []
-            self.seqNumber=0
-            if segmentToStart and  not self.live :
-                self.seqNumber=segmentToStart
-                if   self.seqNumber>=total_frags:
-                    self.seqNumber=total_frags-1
-            #for (seg_i, frag_i) in fragments_list:
-            #for seqNumber in range(0,len(fragments_list)):
-            self.segmentAvailable=0
+            self.seqNumber=fragmentToStart -1
             frameSent=0
-            while True:
-            
-                #if not self.live:
-                #    _write_flv_header2
+            self.statusStream = 'play'
+            while (True and self.statusStream == 'play'):
                     
                 if self.g_stopEvent and self.g_stopEvent.isSet():
                         return
-                seg_i, frag_i=fragments_list[self.seqNumber]
+                seg_i, frag_i,duration_i,size_i,start_byte_i=self.fragments_list[self.seqNumber]
                 self.seqNumber+=1
                 frameSent+=1
                 name = u'Seg%d-Frag%d' % (seg_i, frag_i)
@@ -694,15 +734,19 @@ class F4MDownloader():
                 if 1==1:
                     down_data = success#down.read()
                     reader = FlvReader(down_data)
-                    while True:
+                    while (True and self.statusStream == 'play'):
                         _, box_type, box_data = reader.read_box_info()
                         print  'box_type',box_type,len(box_data)
                         #if box_type == b'afra':
                         #    dest_stream.write(box_data)
                         #    dest_stream.flush()
                         #    break
-                            
-                        if box_type == b'mdat':
+                        conditionOffset = False
+                        if((startRange == 0) or (startRange != 0 and (start_byte_i + len(box_data) >= startRange))):
+                            conditionOffset = True
+                        print 'conditionOffset',conditionOffset
+                        print 'startRangepassed',startRange
+                        if (box_type == b'mdat' ):
                             isDrm=True if ord(box_data[0])&1 else False
                             #print 'isDrm',isDrm,repr(box_data)
                             if 1==2 and isDrm:
@@ -723,8 +767,7 @@ class F4MDownloader():
                             # dest_stream.write(b'\x00')
                             # dest_stream.write(mdat_reader.read())
                             # break
-                self.status='play'
-                if self.seqNumber==len(fragments_list) or (totalSegmentToSend>0 and frameSent==totalSegmentToSend):
+                if self.seqNumber==len(fragments_list):
                     if not self.live:
                         break
                     self.seqNumber=0
@@ -774,7 +817,7 @@ class F4MDownloader():
                 newFragement=None
                 if not lastFragement==None:
                     newFragement=lastFragement+1
-                fragments_list = build_fragments_list(boot_info,newFragement,self.live)
+                fragments_list = build_fragments_list(boot_info,self.total_size,self.total_duration,newFragement,self.live)
                 total_frags = len(fragments_list)
                 #print 'fragments_list',fragments_list, newFragement
                 #print lastSegment
