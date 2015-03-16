@@ -3,7 +3,6 @@ XBMCLocalProxy 0.1
 Copyright 2011 Torben Gerkensmeyer
  
 Modified for F4M format by Shani
-Modified for F4M seeking by Evilsephiroth
  
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -143,7 +142,7 @@ class MyHandler(BaseHTTPRequestHandler):
                     totalsize=int(downloader.total_size)
                     erange=totalsize-1
                     
-                    crange="bytes "+str(srange)+"-" +str(erange) + "/*" 
+                    crange="bytes "+str(srange)+"-" +str(erange) + "/" + str(erange +1) 
                     self.send_header("Content-Range",crange)
                     
                     print crange
@@ -431,6 +430,7 @@ class MyPlayer (xbmc.Player):
         print "seting event in onPlayBackStopped " 
         self.stopPlaying.set();
         print "stop Event is SET" 
+     
 
 
             
